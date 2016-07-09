@@ -3,7 +3,7 @@ Some Perl scripts for handle mysql backup and point-in-time-recovery
 
 #Prerequisites
 
-The following scripts needs that the package "Percona Xtrabackup" is installed on your server.
+The package "Percona Xtrabackup" must be installed on your server.
 It is freeware licensed under GPL and you can get it from http://www.percona.com/software/percona-xtrabackup/.
 
 #Installation
