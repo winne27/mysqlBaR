@@ -1,29 +1,29 @@
-# mysqlBaR
+#Description
 This are some Perl scripts for handle mysql backup and point-in-time-recovery
 
-0. Prerequisites
+#Prerequisites
 
 The following scripts needs that the package "Percona Xtrabackup" is installed on your server.
 It is freeware licensed under GPL and you can get it from http://www.percona.com/software/percona-xtrabackup/.
 
-1. Installation
+#Installation
 
 Copy myBackup and myRestore to a directory which is in the path. Suggestion: /usr/local/bin
 Copy my-backup.cnf and my-restore.cnf to /etc or another directory of your joice.
 
-2. Create backup user in mySql Database
+#Create backup user in mySql Database
 
 Create a user (default name: backup) in the mySql database. Give the following rights to him:
 GRANT RELOAD, LOCK TABLES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'backup'@'localhost' 
 
-3. Configuration
+#Configuration
 
 Have a look to the config file my-backup.cnf and change the options for your needs. If point-in-time
 recovery is requested check if binary logging is enabled in the mysql database. This is done by the 
 following option in my.cnf:
 log-bin=mysql-bin
 
-4. Backup database
+#Backup database
 
 The base of this system are rotating backupsets. This means that after a backupset is "full"
 the next backupset is used. In the case the last backupset is reached all content from the first 
@@ -39,7 +39,7 @@ the next backupset is selected.
 For starting the backup put the following to the crontab of root:
 sudo -u mysql /usr/local/bin/myBackup >/var/log/mybackup.log 2>&1
 
-5. Restore database
+#Restore database
 
 For restoring the database a seperate directory is used. The name of this directory is defined in 
 /etc/my-backup.cnf. The default is /var/lib/mysql-restore. This could changed by a calling parameter of
@@ -63,7 +63,7 @@ Examples for starting the restore:
 myRestore --backupset 2 --increment 5
 myRestore --stop_datetime 2012-01-22-18-15-00
 
-6. Stopping the recovered database service
+#Stopping the recovered database service
 
 The processid of the database service can be found in /var/lib/mysql-restore/basedir/mysql.pid. With
 kill -15 pid
