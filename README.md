@@ -37,7 +37,8 @@ taken until the number defined in the config file is reached. In this case the b
 the next backupset is selected.
 
 For starting the backup put the following to the crontab of root:
-sudo -u mysql /usr/local/bin/myBackup >/var/log/mybackup.log 2>&1
+
+    sudo -u mysql /usr/local/bin/myBackup >/var/log/mybackup.log 2>&1
 
 #Restore database
 
@@ -49,8 +50,10 @@ There are two methods for restoring the database. In the first method you have t
 identifying the backupset and the increment that should be used for restore. This is done by call parameters
 of myRestore.
 
-The second method is a point-in-time recovery of the database. Use parameter 
---stop_datetime=YYYY-MM-DD-HH-MI-SS
+The second method is a point-in-time recovery of the database. Use parameter
+
+    --stop_datetime=YYYY-MM-DD-HH-MI-SS
+
 to determine the time of recovery until. The procedure then detects automatically the necessary backupset and 
 the increments and the binary logs needed for the recovery.
 
@@ -60,11 +63,17 @@ on port 3307 and on socket /var/lib/mysql-restore/basedir/mysql.sock.
 
 Examples for starting the restore:
 
-myRestore --backupset 2 --increment 5
-myRestore --stop_datetime 2012-01-22-18-15-00
+    myRestore --backupset 2 --increment 5
+    myRestore --stop_datetime 2012-01-22-18-15-00
+
+Get all possible options by:
+
+    myRestore --help
 
 #Stopping the recovered database service
 
 The processid of the database service can be found in /var/lib/mysql-restore/basedir/mysql.pid. With
-kill -15 pid
+
+    kill -15 pid
+
 database could be shutdown.
