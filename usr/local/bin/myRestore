@@ -1,0 +1,444 @@
+#!/usr/bin/perl -w
+ 
+use strict;
+use POSIX "strftime";
+use POSIX "tmpnam";
+use POSIX "mktime";
+use FileHandle;
+use File::Path;
+use File::Basename;
+use File::Copy;
+use File::stat;
+use Config::IniFiles;
+use Getopt::Long;
+use List::Util qw[min max];
+
+my $config_file = '/etc/my-backup.cnf';
+my $backupset = 1;
+my $increment = 0;
+my $stop_datetime = '';
+my $stop_datetime_comp = '';
+my $stop_timestamp;
+my $restorebasedir;
+my $restore_dir = '';
+my $incrementaldir;
+my $incrementaldir_orig;
+my $binlog_dir;
+my $binlog_name;
+my $binlog_filename;
+my $binlog_list;
+my $restore_conf;
+my $cfg;
+my $backup_dir = '';
+my $backupsetdir;
+my $backup_user;
+my $mysql_user;
+my $admin_user;
+my $backup_password;
+my $innobackup_bin; 
+my $xtrabackup_bin; 
+my $pointintime;
+my $help;   
+my $digits = 2; 
+my $cmd;
+my $start_position;
+my $first_log_suffix;
+my $last_log_suffix;
+my $line;
+my @parts;
+my $ctime;
+my $i;
+my @datearray;
+my $len;
+my $password;
+my $sb;
+my $mtime;
+my $port;
+my $answer;
+my $database;
+my $database_option;
+
+sub main
+{  
+   print "Startet at " . localtime() . "\n";
+   getoptions();
+
+   my $pid = qx(fuser $port/tcp 2>/dev/null);
+   if ($pid ne '')
+   {
+      print "Another process is listening on port $port. Kill it? (y/N)\n";
+      system('stty','-echo');
+      chop($answer=<STDIN>);
+      system('stty','echo'); 
+      print "\n"; 
+      if ($answer eq 'y')
+      {
+         system("kill -15 $pid");
+      }
+      else
+      {
+         print "processing stopped\n";
+         exit 1;
+      }
+   }
+   print "Password for mysql user $admin_user:\n";
+   system('stty','-echo');
+   chop($password=<STDIN>);
+   system('stty','echo'); 
+   print "\n"; 
+   
+   open(STDOUT, ">/var/log/myrestore.log") || die "Kann stdout.txt nicht öffnen!";
+   open(STDERR, ">/var/log/myrestore.err") || die "Kann stdout.txt nicht öffnen!";
+
+   if ($pointintime)
+   {
+      determineLastBackup();
+   } 
+   else
+   {   
+      $backupsetdir = "$backup_dir/backupset" . sprintf('%0' . $digits  . 'd',$backupset);  
+   }
+   
+   print "Backupdir: $backupsetdir\nNumber of increments: $increment\n\n";
+
+   checkBackupdirs();
+   
+   $restorebasedir = "$restore_dir/basedir";
+   mkpath($restorebasedir);
+   ### Copy base backup to restore base dir
+   print "starting copy ...\n";
+   system("cp -rp $backupsetdir/increment00/* $restorebasedir");
+
+   ### set new path in backup-my.cnf  
+   system("sed -i -e 's%$backupsetdir/increment00%$restorebasedir%g' $restorebasedir/backup-my.cnf 2>&1");
+   
+   if ($increment > 0)
+   {
+      ### Prepare basedir
+      print "\n\n*******************************************************************************\n";
+      print "******* prepare basedir $backupsetdir \n";
+      print "*******************************************************************************\n\n";
+      $cmd = "$innobackup_bin --use-memory=100M --ibbackup=$xtrabackup_bin --apply-log --redo-only  $restorebasedir 2>&1";
+      print "Execute: $cmd\n";
+      system($cmd);
+   }
+   ### Prepare inremental dirs      
+   for ($i = 1;$i <= $increment;$i++)
+   {
+      $incrementaldir_orig = "$backupsetdir/increment" . sprintf('%0' . $digits  . 'd',$i);
+      $incrementaldir = "$restore_dir/increment" . sprintf('%0' . $digits  . 'd',$i);
+
+      system("cp -rp $incrementaldir_orig $restore_dir");
+      my $cmd = "$innobackup_bin  --use-memory=100M --ibbackup=$xtrabackup_bin --apply-log $restorebasedir --incremental-dir=$incrementaldir 2>&1";
+      print "\n\n*******************************************************************************\n";
+      print "******** prepare increment $i \n";
+      print "*******************************************************************************\n\n";
+      print "Execute: $cmd\n";
+      system($cmd);   
+   }      
+
+   ### Prepare basedir finally
+   print "\n\n*******************************************************************************\n";
+   print "******* prepare basedir again \n";
+   print "*******************************************************************************\n\n"; 
+   $cmd = "$innobackup_bin --use-memory=100M --ibbackup=$xtrabackup_bin --apply-log $restorebasedir 2>&1";
+   print "Execute: $cmd\n";
+   system($cmd);
+   system("chown -R mysql:mysql $restore_dir ");
+
+
+   ### Start of restored database 
+   print "\n\n*******************************************************************************\n";
+   print "******* start restored database ";
+   print "*******************************************************************************\n\n"; 
+   $cmd = "nohup /usr/sbin/mysqld --defaults-file=$restore_conf &";
+   print "Execute: $cmd\n";
+   system($cmd);
+   
+   #### do point-in-time recovery
+   if ($pointintime)
+   {
+      ### determine first needed binlog and start position
+
+      open(my $fh, "<", "$restorebasedir/xtrabackup_binlog_pos_innodb") or die "cannot open < $restorebasedir/xtrabackup_binlog_pos_innodb: $!";
+      $line = <$fh>; 
+      chomp($line);  
+           
+      @parts = split(/\s+/,$line);
+      $first_log_suffix = $parts[0];
+      $start_position = $parts[1];
+   
+      @parts = split(/\./,$first_log_suffix);
+      $first_log_suffix = $parts[$#parts];
+      # strip leading zeros
+      $first_log_suffix =~ s/^0+//;
+      
+      ### determine last needed binlog 
+      
+      $len = length($binlog_name);
+      opendir(DIR, $binlog_dir) or die $!;
+      my @files = readdir DIR;
+      my @files_sorted = sort @files;
+      foreach my $file (@files_sorted)
+      {
+         # We only want binlogs
+         next unless (substr($file,0,$len) eq $binlog_name);
+   
+         $ctime = substr($file,7);
+        
+	 $sb = stat("$binlog_dir/$file");
+	 $mtime = $sb->mtime;
+         if ($mtime gt $stop_timestamp) 
+         {
+            $last_log_suffix = substr($file,$len+1);
+            $last_log_suffix =~ s/^0+//;
+            $last_log_suffix++;
+            last
+         }
+      }
+      closedir(DIR); 
+      print "First binlog: $first_log_suffix Last binlog: $last_log_suffix\n";      
+ 
+      ### copy binlogs    
+      
+      $binlog_list = '';
+      for ($i = $first_log_suffix; $i <= $last_log_suffix; $i++)
+      {
+         $binlog_filename = "$binlog_dir/$binlog_name." . sprintf('%06d',$i);
+         $binlog_list = $binlog_list . " $restorebasedir/$binlog_name." . sprintf('%06d',$i);
+         system("cp -pr $binlog_dir/$binlog_name." . sprintf('%06d',$i) . " $restorebasedir");   
+      }
+
+      system("chown -R mysql:mysql $restorebasedir");
+
+      ### start point-in-time recovery
+      print "\n\n*******************************************************************************\n";
+      print "******* starting point-in-time recovery \n";
+      print "*******************************************************************************\n\n"; 
+
+      print "Waiting for recovery db coming up ... \n";
+
+      ### wait until DB is up
+      while (! (-e "$restorebasedir/mysqld.sock"))
+      {
+         sleep(1);
+      }	
+      $cmd = "mysqlbinlog --no-defaults $database_option --start-position=$start_position --stop-datetime=\"$stop_datetime\" $binlog_list | mysql -u $admin_user --password=$password -S $restorebasedir/mysqld.sock 2>&1";
+      print "Execute: $cmd\n";
+      system($cmd);
+   } 
+   print "Finished at " . localtime() . "\n";
+}
+
+sub getoptions
+{
+   # read command line options
+   
+   my $rcode = GetOptions('config_file=s'   => \$config_file,
+                          'restore_dir=s'   => \$restore_dir,
+                          'backupset=i'     => \$backupset,
+                          'increment=i'     => \$increment,
+                          'stop_datetime=s' => \$stop_datetime,
+                          'backup_dir=s'    => \$backup_dir,
+                          'database=s'      => \$database,
+                          'help'            => \$help  
+   );
+   
+   # check command line options
+   
+   if (!$rcode) 
+   {
+       # failed to read options
+       print STDERR "Bad command line arguments\n";
+       exit(1);
+   }
+
+   if ($database)
+   {
+      $database_option = '--database=' . $database;
+   }
+   else
+   {
+      $database_option = '';
+   }
+
+   if ($help) 
+   {
+       # print help text and exit
+       printhelp();
+       exit(0);
+   }
+   if ($backupset > 0 && $stop_datetime ne '')
+   {
+       # failed to read options
+   #    print STDERR "options 'backupset' and 'stop_datetime' are mutually exclusive\n";
+   #    exit(1);
+   }
+   if ($backupset == 0 && $increment > 0)
+   {
+       # failed to read options
+       print STDERR "option 'increment' also needs option 'backupset'\n";
+       exit(1);
+   }
+   # Read options from $config_file
+   
+   $cfg = Config::IniFiles->new( -file => $config_file);
+   if ($backup_dir eq '')
+   {
+      $backup_dir = $cfg->val('xtrabackup','backup_dir','/var/lib/mysql-backup');
+   }
+   if ($restore_dir eq '')
+   {
+      $restore_dir = $cfg->val('xtrabackup','restore_dir','/var/lib/mysql-restore');
+   }
+   $backup_user     = $cfg->val('xtrabackup','backup_user','backup');
+   $admin_user      = $cfg->val('xtrabackup','admin_user','admin');
+   $mysql_user      = $cfg->val('xtrabackup','mysql_user','mysql');
+   $backup_password = $cfg->val('xtrabackup','backup_password','secret');
+   $innobackup_bin  = $cfg->val('xtrabackup','innobackup_bin','/usr/local/bin/innobackupex');
+   $xtrabackup_bin  = $cfg->val('xtrabackup','xtrabackup_bin','/usr/local/bin/xtrabackup_51');
+   $restore_conf    = $cfg->val('xtrabackup','restore_conf','/etc/my-restore.cnf');
+   $binlog_dir      = $cfg->val('xtrabackup','binlog_dir','/var/lib/mysql');
+   $binlog_name     = $cfg->val('xtrabackup','binlog_name','mysql-bin');
+   $port            = $cfg->val('xtrabackup','restore_port','3307');
+   
+   $pointintime = ($stop_datetime ne '') ? 1 : 0;
+
+   if ($pointintime)
+   {
+      $stop_datetime_comp = $stop_datetime;
+      $stop_datetime_comp =~ s/ |:/-/g;
+   }
+
+   if (! -d $backup_dir)
+   {
+       print STDERR "backup_dir $backup_dir is not a directory\n";
+       exit(1);
+   }
+
+   if (! -d $restore_dir)
+   {
+       print STDERR "restore_dir $restore_dir is not a directory\n";
+       exit(1);
+   }
+}
+
+sub determineLastBackup()
+{
+   @datearray = split('[\/\.\-\:\ ]', $stop_datetime);
+
+   $stop_timestamp = mktime($datearray[5],$datearray[4],$datearray[3],$datearray[2],$datearray[1] - 1,$datearray[0] - 1900);
+   opendir(DIR, $backup_dir) or die $!;
+
+   my @files = readdir DIR;
+   my @files_sorted = sort @files;
+   foreach my $file (@files_sorted)
+   {
+      # We only want symbolic links
+      next unless (-l "$backup_dir/$file");
+
+      $ctime = substr($file,7);
+      
+      if ($ctime gt $stop_datetime_comp) 
+      {
+         last
+      }
+      else
+      {
+         $incrementaldir = "$backup_dir/" . readlink("$backup_dir/$file");
+      }
+   }
+   closedir(DIR); 
+
+   @parts = split(/increment/,$incrementaldir);
+   $backupsetdir = $parts[0];
+   $backupsetdir =~ s/\/$//;
+   $increment = $parts[$#parts];  
+} 
+
+sub checkBackupdirs()
+{
+   
+   # check source dirs
+  
+  
+   if ( ! -d $backupsetdir )
+   {
+       print STDERR "Backup directory $backupsetdir does not exist\n";
+       exit(1);
+   }
+
+   for ($i = 0;$i <= $increment;$i++)
+   {
+      if ( ! -d "$backupsetdir/increment" . sprintf('%0' . $digits  . 'd',$i) )
+      {
+          print STDERR "Backup directory $backupsetdir/increment" . sprintf('%0' . $digits  . 'd',$i) . " does not exist\n";
+          exit(1);
+      }           
+   }
+
+   # check target dir
+
+   if ( ! -d $restore_dir )
+   {
+       print STDERR "Restore directory $restore_dir does not exist\n";
+       exit(1);
+   }
+   if ( ! (-r $restore_dir && -w $restore_dir && -x $restore_dir))
+   {
+       print STDERR "Read, write and execute is needed on restore directory $restore_dir\n";
+       exit(1);
+   }
+   
+   # clean target dir 
+   print "start cleaning $restore_dir ...\n"; 
+   system("rm -rf $restore_dir/*");
+
+}
+
+sub printhelp
+{
+   print "
+   
+   myRestore [options]
+   
+   Starts the restore of a backup made by myBackup.  
+   
+   Options:
+   
+   --config_file       The path of the config file (default: /etc/my-backup.cnf)
+                     
+   --backup_dir        The directory which contains the backupsets.
+		       This directory must exist and must be owned by mysql.	
+                       (default: /var/lib/mysql-backup)           
+
+   --restore_dir       The directory that is used for the recovery. The needed backups 
+                       are copied to this directory. Overwrites the value from config file. 
+		       This directory must exist and must be owned by mysql.	
+                       (default: /var/lib/mysql-restore)           
+
+   --backupset         The number of the backup set used for recovery.            
+                       (default: 1)
+   
+   --increment         The increment used for recovery. Requires also option --backupset. 
+                       The value 0, the default, means the full backup of the selected backup set.            
+                       (default: 0)
+   
+   --stop_datetime     Timestamp for point-in-time recovery. The format is: YYYY-MM-DD HH:MI:SS
+                       Can not used together with options backupset and increment           
+   
+   --database          restore single database only
+
+   --help              Show this help text.                         
+
+   Example:
+   --------
+   myRestore --backupset=1 --increment=2    
+   myRestore --stop_datetime=\"2014-12-08 15:08:32\"
+
+   Start the recovered DB:
+   /usr/sbin/mysqld  --defaults-file=/etc/my-restore.cnf &
+   \n";
+}
+
+main();

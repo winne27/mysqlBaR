@@ -1,0 +1,241 @@
+#!/usr/bin/perl -w
+
+use strict;
+use POSIX "strftime";
+use POSIX "tmpnam";
+use FileHandle;
+use File::Basename;
+use Config::IniFiles;
+use Getopt::Long;
+use File::Path;
+use List::Util qw[min max];
+
+my $cfg;
+my $backup_path;
+my $backup_path_new;
+my $backup_path_old;
+my $backup_type;
+my $backup_set_old;
+my $increment_old;
+my $backup_set_new;
+my $increment_new;
+my $last_backup_file; 
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst,$timestamp);
+my $digits;
+my $cmd;
+
+sub main()
+{
+	# read command line options
+	
+	my $config_file = '/etc/my-backup.cnf';
+	my $rcode = GetOptions('config_file=s' => \$config_file);
+	
+	# Read parameters from $config_file
+	
+	$cfg = Config::IniFiles->new( -file => $config_file);
+	my $backupdir = $cfg->val('xtrabackup','backup_dir','/var/lib/mysql-backup');
+	my $backup_sets = $cfg->val('xtrabackup','backup_sets','2');
+	my $backup_increments = $cfg->val('xtrabackup','backup_increments','0');
+	my $backup_user = $cfg->val('xtrabackup','backup_user','backup');
+	my $backup_password = $cfg->val('xtrabackup','backup_password','secret');
+	my $innobackup_bin = $cfg->val('xtrabackup','innobackup_bin','/usr/bin/innobackupex');
+	my $xtrabackup_bin = $cfg->val('xtrabackup','xtrabackup_bin','/usr/bin/xtrabackup');
+	my $binlog_dir     = $cfg->val('xtrabackup','binlog_dir','/var/lib/mysql');
+	my $binlog_name     = $cfg->val('xtrabackup','binlog_name','mysql-bin');
+	
+	$innobackup_bin = $innobackup_bin . " --defaults-File=/etc/mysql/my.cnf";
+	
+	# Determine the length of directory suffix
+	
+	if (max($backup_sets,$backup_increments) < 100)
+	{
+	   $digits = 2;  
+	}
+	else
+	{
+	   $digits = length(max($backup_sets,$backup_increments));  
+	}
+	
+	#determine next backup
+	
+	$last_backup_file = "$backupdir/lastbackup";
+	if ( -f $last_backup_file )
+	{
+	   $cfg = Config::IniFiles->new( -file => $last_backup_file);
+	   $backup_set_old = $cfg->val('lastbackup','backup_set');     
+	   $increment_old = $cfg->val('lastbackup','increment');
+	   $backup_path_old = "$backupdir/backupset$backup_set_old/increment$increment_old";
+	   
+	   if ($increment_old < $backup_increments)
+	   {
+	      $increment_new = sprintf('%0' . $digits  . 'd',$increment_old + 1); 
+	      $backup_set_new = $backup_set_old;
+	      $backup_type = "increment"; 
+	   }
+	   else
+	   {
+	      $backup_type = "full";
+	      $backup_set_new = sprintf('%0' . $digits  . 'd',($backup_set_old % $backup_sets) + 1);
+	      $increment_new = "00";          
+	   } 
+	   $cfg->setval('lastbackup','backup_set',$backup_set_new);     
+	   $cfg->setval('lastbackup','increment',$increment_new);    
+	}
+	else
+	{
+	   $cfg = Config::IniFiles->new(); 
+	   $cfg->SetFileName($last_backup_file);
+	   $backup_type = "full";
+	   $backup_set_new = sprintf('%0' . $digits  . 'd',"1");
+	   $increment_new = sprintf('%0' . $digits  . 'd',"0");
+	   $cfg->newval('lastbackup','backup_set',$backup_set_new);     
+	   $cfg->newval('lastbackup','increment',$increment_new); 
+	}
+	
+	# Cleanup Directories
+	
+	chdir $backupdir  or die;
+	$backup_path_new = "$backupdir/backupset$backup_set_new/increment$increment_new";
+	print "New backup path: $backup_path_new \n";
+	if ($backup_type eq "full")
+	{
+	   if ( -d "$backupdir/backupset$backup_set_new") 
+	   {
+	      print "Remove path: $backupdir/backupset$backup_set_new \n";
+	      system("rm -r $backupdir/backupset$backup_set_new/*");
+	   }
+	   mkpath("$backupdir/backupset$backup_set_new");
+	}
+	else
+	{
+	   if ( -d $backup_path_new) {rmtree($backup_path_new);}
+	}
+	
+	# remove broken symlinks
+	
+	chdir $backupdir  or die;
+	opendir(DIR, '.') or die;
+	foreach my $link (readdir DIR) 
+	{
+	   next unless -l $link and not -e readlink($link);
+	   unlink $link;
+	}
+	closedir DIR;
+	
+	# Make Backup
+	
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+	$timestamp = sprintf "%4d-%02d-%02d-%02d-%02d-%02d",$year+1900,$mon+1,$mday,$hour,$min,$sec;
+	
+	if ($backup_type eq "full")
+	{
+	   system("$innobackup_bin --slave-info --safe-slave-backup --password=$backup_password --user=$backup_user --ibbackup=$xtrabackup_bin --no-timestamp $backup_path_new");
+	}
+	else
+	{
+	   system("$innobackup_bin --slave-info --safe-slave-backup --password=$backup_password --user=$backup_user --ibbackup=$xtrabackup_bin --incremental --incremental-basedir=$backup_path_old --no-timestamp $backup_path_new");         
+	}
+	
+	if ($? != 0) {exit;}
+	
+	chdir($backupdir);
+	symlink "backupset$backup_set_new/increment$increment_new","backup-$timestamp";
+	
+	# Rewrite lastbackup config file
+	
+	$cfg->RewriteConfig();
+	
+	# Write first and last binlog sequence number
+	
+	
+	system("cat $backupdir/backupset$backup_set_new/increment$increment_new/xtrabackup_binlog_info | cut -f1 > $backupdir/backupset$backup_set_new/binlog-last");
+	
+	if ($increment_new eq '00')
+	{
+           ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+           $timestamp = sprintf "%4d-%02d-%02d %02d-%02d-%02d",$year+1900,$mon+1,$mday,$hour,$min,$sec;
+           system("print $timestamp > $backupdir/backupset$backup_set_new/timestamp-first");
+           system("print $timestamp > $backupdir/backupset$backup_set_old/timestamp-last");
+	   system("cat $backupdir/backupset$backup_set_new/increment$increment_new/xtrabackup_binlog_info | cut -f1 > $backupdir/backupset$backup_set_new/binlog-first");
+	   system("cat $backupdir/backupset$backup_set_new/increment$increment_new/xtrabackup_binlog_info | cut -f1 > $backupdir/backupset$backup_set_old/binlog-last");
+	   setBinlogSymlinks("$backupdir/backupset$backup_set_old", $binlog_dir, $binlog_name);
+	   replaceSymlinkByFile("$backupdir/backupset$backup_set_old", $binlog_dir, $binlog_name);	
+	}
+	setBinlogSymlinks("$backupdir/backupset$backup_set_new", $binlog_dir, $binlog_name);
+}
+
+sub setBinlogSymlinks()
+{
+   my $backupset_path = $_[0];
+   my $binlog_dir = $_[1];
+   my $binlog_name = $_[2];
+   
+   open(FILE, "$backupset_path/binlog-first") or die "Can't read file $backupset_path/binlog-first [$!]\n";  
+   my $binlog_first = <FILE>; 
+   $binlog_first =~ s/^\s+|\s+$//g; ## strip whitespace
+   close (FILE);  
+
+   open(FILE, "$backupset_path/binlog-last") or die "Can't read file $backupset_path/binlog-last [$!]\n";  
+   my $binlog_last = <FILE>;
+   $binlog_last =~ s/^\s+|\s+$//g;  ## strip whitespace
+   close (FILE);  
+	
+   print "binlogs von $binlog_first bis $binlog_last \n";
+	
+   opendir(MYDIR, $binlog_dir) or die $!;
+  
+   my @files = grep {/^${binlog_name}/} readdir MYDIR;
+   my @files_sorted = sort @files;
+   my $needed = 0;
+
+   foreach my $file (@files_sorted)
+   {
+      if ($file eq $binlog_first)
+      {
+         $needed = 1;	
+      } 
+
+      if ($needed)
+      {
+         my $cmd = "ln -sf $binlog_dir/$file $backupset_path/$file";	
+         print "$cmd\n";
+         system($cmd);
+      }
+
+      if ($file eq $binlog_last)
+      {
+         $needed = 0;	
+      } 
+   }
+   closedir(MYDIR); 
+}
+
+sub replaceSymlinkByFile()
+{
+	my $backupset_path = $_[0];
+   my $binlog_dir = $_[1];
+   my $binlog_name = $_[2];
+
+   opendir(MYDIR, $backupset_path) or die $!;
+  
+   my @files = grep {/^${binlog_name}/} readdir MYDIR;
+
+   foreach my $file (@files)
+   {
+      # We only want symbolic links
+      next unless (-l "$backupset_path/$file");
+      
+      # delete symbolic link
+           $cmd = "rm $backupset_path/$file";
+  	   print "$cmd\n";
+	   system($cmd);
+      # copy file
+	   $cmd = "cp -p $binlog_dir/$file $backupset_path/";
+	   print "$cmd\n";
+	   system($cmd);
+   }
+   closedir(MYDIR);
+}
+
+main();
